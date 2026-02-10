@@ -1,29 +1,65 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
+import sqlite3
+import os
+import tempfile
+from datetime import datetime
 
 # ================= 1. 页面配置 =================
-st.set_page_config(page_title="海外仓时效看板 V6.3", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="海外仓时效看板 V7.0", page_icon="🚀", layout="wide")
 st.markdown("""<style>div[data-testid="stMetricValue"] {font-size: 24px; font-weight: bold;} .block-container {padding-top: 1rem;}</style>""", unsafe_allow_html=True)
 
 # ================= 2. 数据处理核心 =================
 @st.cache_data(ttl=3600)
-def load_data(uploaded_file):
+def load_data(file_or_path):
     try:
-        df = pd.read_parquet(uploaded_file)
+        # 1. 判断是否为 Parquet 文件
+        is_parquet = False
+        if isinstance(file_or_path, str):
+            if file_or_path.endswith('.parquet'): is_parquet = True
+        else:
+            if file_or_path.name.endswith('.parquet'): is_parquet = True
+            
+        if is_parquet:
+            df = pd.read_parquet(file_or_path)
+            # 确保时间列为 datetime (Parquet通常保留类型，但为了保险)
+            time_cols = ['Time_Audit', 'Time_Shipped', 'Time_Online', 'Time_Delivered']
+            for col in time_cols:
+                if col in df.columns:
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+            return df
+
+        # 2. SQLite 处理逻辑
+        db_path = file_or_path
+        if not isinstance(file_or_path, str):
+            # 上传的文件需保存为临时文件才能被 sqlite3 读取
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+                tmp.write(file_or_path.getvalue())
+                db_path = tmp.name
         
-        # 1. 仅做必要的类型恢复 (Parquet通常会保留类型，但为了保险)
+        # 缓存键策略：如果是本地文件，检查修改时间
+        if isinstance(db_path, str) and os.path.exists(db_path):
+             mtime = os.path.getmtime(db_path)
+
+        conn = sqlite3.connect(db_path)
+        query = "SELECT * FROM orders"
+        df = pd.read_sql(query, conn)
+        conn.close()
+        
+        # 类型恢复
         time_cols = ['Time_Audit', 'Time_Shipped', 'Time_Online', 'Time_Delivered']
         for col in time_cols:
-            if col in df.columns: df[col] = pd.to_datetime(df[col], errors='coerce')
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
 
-        # 2. 供应商提取
         if 'Warehouse' in df.columns:
             df['Warehouse'] = df['Warehouse'].astype(str)
             df['Provider'] = df['Warehouse'].apply(lambda x: x.split('-')[0] if '-' in x else x)
+            
         return df
     except Exception as e:
-        st.error(f"数据错误: {e}")
+        st.error(f"数据加载错误: {e}")
         return pd.DataFrame()
 
 # ================= 3. 绘图函数 =================
@@ -56,7 +92,7 @@ def get_trend_data(df, date_col, metric_col, granularity, mode='rate'):
     def fmt_val(val): return f"{val:.1%}" if mode == 'rate' else f"{val:.1f}h"
     
     if granularity == '周 (Week)':
-        res['Data_Label'] = "WEEK" + pd.Series(range(1, len(res)+1)).astype(str) + "\n" + res['Value'].apply(fmt_val)
+        res['Data_Label'] = "WEEK" + res['Date'].dt.isocalendar().week.astype(str) + "\n" + res['Value'].apply(fmt_val)
         res['Trend'] = res['Value']
     elif granularity == '月 (Month)':
         res['Data_Label'] = res['Date'].dt.strftime('%Y-%m') + "\n" + res['Value'].apply(fmt_val)
@@ -85,146 +121,162 @@ def plot_trend_interactive(data, x_fmt, title, is_percent=True, target_line=None
     return chart.properties(height=300).interactive()
 
 # ================= 4. 主程序 =================
-st.title("📊 海外仓时效看板 V6.3")
-with st.expander("📂 数据源管理", expanded=True):
-    uploaded_file = st.file_uploader("上传 Parquet 文件", type=['parquet'], label_visibility="collapsed")
+st.title("📊 海外仓时效看板 V7.0")
 
-if uploaded_file:
-    df = load_data(uploaded_file)
-    if not df.empty:
-        st.divider()
-        # === 控制台 ===
-        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
-        with c1:
-            view_mode = st.radio("1. 分析维度", ["按仓库 (Detail)", "按供应商 (Aggregate)", "按物流商 (Carrier)"], horizontal=True)
-            group_col = 'Warehouse' if "仓库" in view_mode else 'Provider' if "供应商" in view_mode else 'Carrier'
-        with c2:
-            min_d, max_d = df['Time_Audit'].min().date(), df['Time_Audit'].max().date()
-            date_range = st.date_input("2. 日期范围", value=(min_d, max_d))
-        with c3:
-            granularity = st.selectbox("3. 趋势粒度", ["天 (Day)", "周 (Week)", "月 (Month)"], index=0)
-        with c4:
-            countries = sorted(df['Country'].unique())
-            sel_ctry = st.multiselect("4. 国家筛选", countries, default=countries)
+# --- 双模式加载逻辑 ---
+DB_PATH = "shipping_data.db"
+df = pd.DataFrame()
 
-        cc1, cc2 = st.columns([1, 1])
-        with cc1:
-            all_carriers = sorted(df['Carrier'].dropna().unique().tolist())
-            sel_carrier_global = st.multiselect("5. 全局物流商筛选 (如只看FedEx请勾选)", all_carriers, default=[])
-        with cc2:
-            all_targets = sorted(df[group_col].dropna().unique().tolist())
-            sel_targets = st.multiselect(f"6. 筛选特定{group_col} (Detail)", all_targets, default=[])
-
-        # === 筛选 ===
-        mask = (df['Time_Audit'].dt.date >= date_range[0]) & (df['Time_Audit'].dt.date <= date_range[1]) & (df['Country'].isin(sel_ctry))
-        if sel_carrier_global: mask = mask & (df['Carrier'].isin(sel_carrier_global))
-        df_show = df[mask].copy()
-        if sel_targets: df_show = df_show[df_show[group_col].isin(sel_targets)]
-
-        if df_show.empty:
-            st.warning("⚠️ 无数据")
-            st.stop()
-        st.divider()
-
-        # === 模块一：24H 发货 ===
-        st.subheader(f"🏭 1. {group_col}作业效率 (24H发货率)")
-        stats_ship = df_show.groupby(group_col).agg(Rate=('is_24h_Ship', 'mean'), Count=('is_24h_Ship', 'count')).reset_index()
-        stats_ship['Label'] = stats_ship['Rate'].apply(lambda x: f"{x:.1%}") + " | " + stats_ship['Count'].astype(str)
-        c1, c2 = st.columns([3, 1])
-        with c1: st.altair_chart(plot_bar_chart(stats_ship, 'Rate', group_col, '24H 发货率', 0.75, 'Label'), use_container_width=True)
-        with c2:
-            tgt = st.selectbox(f"趋势-{group_col}", stats_ship.sort_values('Rate')[group_col], key='s1')
-            if tgt:
-                d, f = get_trend_data(df_show[df_show[group_col]==tgt], 'Time_Audit', 'is_24h_Ship', granularity, 'rate')
-                st.altair_chart(plot_trend_interactive(d, f, '发货率', True, 0.95), use_container_width=True)
-        st.divider()
-
-        # === 模块二：48H 上网 ===
-        st.subheader(f"🌐 2. {group_col}物流效率 (48H上网率)")
-        stats_ol = df_show.groupby(group_col).agg(Rate=('is_48h_Online', 'mean'), Count=('is_48h_Online', 'count')).reset_index()
-        stats_ol['Label'] = stats_ol['Rate'].apply(lambda x: f"{x:.1%}") + " | " + stats_ol['Count'].astype(str)
-        c1, c2 = st.columns([3, 1])
-        with c1: st.altair_chart(plot_bar_chart(stats_ol, 'Rate', group_col, '48H 上网率', 0.90, 'Label'), use_container_width=True)
-        with c2:
-            tgt = st.selectbox(f"趋势-{group_col}", stats_ol.sort_values('Rate')[group_col], key='s2')
-            if tgt:
-                d, f = get_trend_data(df_show[df_show[group_col]==tgt], 'Time_Audit', 'is_48h_Online', granularity, 'rate')
-                st.altair_chart(plot_trend_interactive(d, f, '上网率', True, 0.95), use_container_width=True)
-        st.divider()
-
-        # === 模块三：揽收时效 ===
-        st.subheader(f"🚛 3. 尾程揽收时效 (Handover)")
-        valid_ho = df_show[df_show['Hours_Handover'] > 0]
-        if valid_ho.empty: st.warning("无数据")
-        else:
-            stats_ho = valid_ho.groupby(group_col).agg(Val=('Hours_Handover', 'mean'), Count=('Hours_Handover', 'count')).reset_index()
-            stats_ho['Label'] = stats_ho['Val'].apply(lambda x: f"{x:.1f}h") + " | " + stats_ho['Count'].astype(str)
-            c1, c2 = st.columns([3, 1])
-            with c1: st.altair_chart(plot_bar_chart(stats_ho, 'Val', group_col, '平均耗时(h)', 24, 'Label', True), use_container_width=True)
-            with c2:
-                tgt = st.selectbox(f"趋势-{group_col}", stats_ho.sort_values('Val', ascending=False)[group_col], key='s3')
-                if tgt:
-                    d, f = get_trend_data(valid_ho[valid_ho[group_col]==tgt], 'Time_Shipped', 'Hours_Handover', granularity, 'mean')
-                    st.altair_chart(plot_trend_interactive(d, f, '平均耗时(h)', False, 24), use_container_width=True)
-        st.divider()
-
-        # === 模块四：妥投时效 (使用预计算字段) ===
-        st.subheader("📦 4. 尾程妥投时效 (Days Transit)")
-        # 直接使用 Days_Transit (已在清洗阶段计算：妥投-发货)
-        if 'Days_Transit' in df_show.columns:
-            valid_otd = df_show[df_show['Days_Transit'].notnull()].copy()
-            # 剔除异常值 (比如 > 30天)
-            valid_otd = valid_otd[(valid_otd['Days_Transit'] >= 0) & (valid_otd['Days_Transit'] <= 30)]
-
-            if valid_otd.empty:
-                st.warning("无有效妥投数据 (请检查源数据是否有签收时间)")
-            else:
-                # 判断是否只选了 US
-                u_ctry = valid_otd['Country'].dropna().unique()
-                is_us_mode = (len(sel_ctry)==1 and 'US' in sel_ctry) or (len(u_ctry)==1 and u_ctry[0]=='US')
-
-                if not is_us_mode: # 全球模式
-                    st.markdown("##### 🌍 全球/区域概览")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        s_wh = valid_otd.groupby('Warehouse').agg(Val=('Days_Transit', 'mean'), Count=('Order_ID', 'count')).reset_index()
-                        s_wh = s_wh[s_wh['Count']>5].sort_values('Val').head(15)
-                        s_wh['Label'] = s_wh['Val'].apply(lambda x: f"{x:.1f}d")
-                        st.altair_chart(plot_bar_chart(s_wh, 'Val', 'Warehouse', '天数', 7, 'Label', True), use_container_width=True)
-                    with c2:
-                        s_car = valid_otd.groupby('Carrier').agg(Val=('Days_Transit', 'mean'), Count=('Order_ID', 'count')).reset_index()
-                        s_car = s_car[s_car['Count']>5].sort_values('Val').head(15)
-                        s_car['Label'] = s_car['Val'].apply(lambda x: f"{x:.1f}d")
-                        st.altair_chart(plot_bar_chart(s_car, 'Val', 'Carrier', '天数', 7, 'Label', True), use_container_width=True)
-                else: # US 模式
-                    st.markdown("##### 🇺🇸 美国 (US) 深度分析")
-                    if 'Province_State' not in valid_otd.columns: st.error("缺州字段")
-                    else:
-                        c1, c2, c3 = st.columns(3)
-                        with c1: sel_wh = st.selectbox("📦 仓库", ['全部'] + sorted(valid_otd['Warehouse'].unique()), key='u1')
-                        with c2: sel_car = st.multiselect("🚛 物流商", sorted(valid_otd['Carrier'].unique()), key='u2')
-                        with c3: sel_st = st.multiselect("📍 目的州", sorted(valid_otd['Province_State'].dropna().unique()), key='u3')
-                        
-                        df_u = valid_otd.copy()
-                        if sel_wh != '全部': df_u = df_u[df_u['Warehouse'] == sel_wh]
-                        if sel_car: df_u = df_u[df_u['Carrier'].isin(sel_car)]
-                        if sel_st: df_u = df_u[df_u['Province_State'].isin(sel_st)]
-                        
-                        if not sel_st: # 热力图
-                            st.markdown("**🇺🇸 全美热力图 (Transit Time)**")
-                            s_map = df_u.groupby(['Carrier', 'Province_State']).agg(Val=('Days_Transit', 'mean'), C=('Order_ID', 'count')).reset_index()
-                            s_map = s_map[s_map['C'] >= 5]
-                            if not s_map.empty:
-                                base = alt.Chart(s_map).encode(x='Province_State:N', y='Carrier:N')
-                                heat = base.mark_rect().encode(color=alt.Color('Val:Q', scale=alt.Scale(scheme='yelloworangered')))
-                                txt = base.mark_text().encode(text=alt.Text('Val', format='.1f'), color=alt.value('black'))
-                                st.altair_chart((heat+txt).properties(height=350).interactive(), use_container_width=True)
-                        else: # 条形图
-                            st.markdown(f"**📍 {', '.join(sel_st)} 物流商对比**")
-                            s_cmp = df_u.groupby('Carrier').agg(Val=('Days_Transit', 'mean'), C=('Order_ID', 'count')).reset_index()
-                            s_cmp['Label'] = s_cmp['Val'].apply(lambda x: f"{x:.1f}d")
-                            st.altair_chart(plot_bar_chart(s_cmp, 'Val', 'Carrier', '平均天数', 5, 'Label', True), use_container_width=True)
-        else:
-            st.info("缺 Days_Transit 字段，请重新运行清洗脚本")
+if os.path.exists(DB_PATH):
+    # 【模式A】本地检测到数据库文件 -> 自动加载
+    with st.spinner("📦 检测到本地数据库，正在自动加载数据..."):
+        df = load_data(DB_PATH)
+        st.success(f"✅ 已加载本地数据库 (最近更新: {datetime.fromtimestamp(os.path.getmtime(DB_PATH)).strftime('%Y-%m-%d %H:%M')})")
 else:
-    st.info("👆 请上传数据")
+    # 【模式B】Cloud/无文件 -> 显示上传框 (支持 .db 和 .parquet)
+    with st.expander("📂 数据源上传 (Cloud模式)", expanded=True):
+        st.info("💡 提示：支持上传 .parquet (推荐，体积小) 或 .db (数据库) 文件")
+        uploaded_file = st.file_uploader("请上传数据文件 (.parquet / .db)", type=['parquet', 'db'])
+        if uploaded_file:
+            df = load_data(uploaded_file)
+            st.success(f"✅ 文件加载成功: {uploaded_file.name}")
+
+# --- 加载后逻辑 ---
+if not df.empty:
+    st.divider()
+    # === 控制台 ===
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    with c1:
+        view_mode = st.radio("1. 分析维度", ["按仓库 (Detail)", "按供应商 (Aggregate)", "按物流商 (Carrier)"], horizontal=True)
+        group_col = 'Warehouse' if "仓库" in view_mode else 'Provider' if "供应商" in view_mode else 'Carrier'
+    with c2:
+        min_d, max_d = df['Time_Audit'].min().date(), df['Time_Audit'].max().date()
+        date_range = st.date_input("2. 日期范围", value=(min_d, max_d))
+    with c3:
+        granularity = st.selectbox("3. 趋势粒度", ["天 (Day)", "周 (Week)", "月 (Month)"], index=0)
+    with c4:
+        countries = sorted(df['Country'].unique())
+        sel_ctry = st.multiselect("4. 国家筛选", countries, default=countries)
+
+    cc1, cc2 = st.columns([1, 1])
+    with cc1:
+        all_carriers = sorted(df['Carrier'].dropna().unique().tolist())
+        sel_carrier_global = st.multiselect("5. 全局物流商筛选 (如只看FedEx请勾选)", all_carriers, default=[])
+    with cc2:
+        all_targets = sorted(df[group_col].dropna().unique().tolist())
+        sel_targets = st.multiselect(f"6. 筛选特定{group_col} (Detail)", all_targets, default=[])
+
+    # === 筛选 ===
+    mask = (df['Time_Audit'].dt.date >= date_range[0]) & (df['Time_Audit'].dt.date <= date_range[1]) & (df['Country'].isin(sel_ctry))
+    if sel_carrier_global: mask = mask & (df['Carrier'].isin(sel_carrier_global))
+    df_show = df[mask].copy()
+    if sel_targets: df_show = df_show[df_show[group_col].isin(sel_targets)]
+
+    if df_show.empty:
+        st.warning("⚠️ 无数据")
+        st.stop()
+    st.divider()
+
+    # === 模块一：24H 发货 ===
+    st.subheader(f"🏭 1. {group_col}作业效率 (24H发货率)")
+    stats_ship = df_show.groupby(group_col).agg(Rate=('is_24h_Ship', 'mean'), Count=('is_24h_Ship', 'count')).reset_index()
+    stats_ship['Label'] = stats_ship['Rate'].apply(lambda x: f"{x:.1%}") + " | " + stats_ship['Count'].astype(str)
+    c1, c2 = st.columns([3, 1])
+    with c1: st.altair_chart(plot_bar_chart(stats_ship, 'Rate', group_col, '24H 发货率', 0.75, 'Label'), use_container_width=True)
+    with c2:
+        tgt = st.selectbox(f"趋势-{group_col}", stats_ship.sort_values('Rate')[group_col], key='s1')
+        if tgt:
+            d, f = get_trend_data(df_show[df_show[group_col]==tgt], 'Time_Audit', 'is_24h_Ship', granularity, 'rate')
+            st.altair_chart(plot_trend_interactive(d, f, '发货率', True, 0.95), use_container_width=True)
+    st.divider()
+
+    # === 模块二：48H 上网 ===
+    st.subheader(f"🌐 2. {group_col}物流效率 (48H上网率)")
+    stats_ol = df_show.groupby(group_col).agg(Rate=('is_48h_Online', 'mean'), Count=('is_48h_Online', 'count')).reset_index()
+    stats_ol['Label'] = stats_ol['Rate'].apply(lambda x: f"{x:.1%}") + " | " + stats_ol['Count'].astype(str)
+    c1, c2 = st.columns([3, 1])
+    with c1: st.altair_chart(plot_bar_chart(stats_ol, 'Rate', group_col, '48H 上网率', 0.90, 'Label'), use_container_width=True)
+    with c2:
+        tgt = st.selectbox(f"趋势-{group_col}", stats_ol.sort_values('Rate')[group_col], key='s2')
+        if tgt:
+            d, f = get_trend_data(df_show[df_show[group_col]==tgt], 'Time_Audit', 'is_48h_Online', granularity, 'rate')
+            st.altair_chart(plot_trend_interactive(d, f, '上网率', True, 0.95), use_container_width=True)
+    st.divider()
+
+    # === 模块三：揽收时效 ===
+    st.subheader(f"🚛 3. 尾程揽收时效 (Handover)")
+    valid_ho = df_show[df_show['Hours_Handover'] > 0]
+    if valid_ho.empty: st.warning("无数据")
+    else:
+        stats_ho = valid_ho.groupby(group_col).agg(Val=('Hours_Handover', 'mean'), Count=('Hours_Handover', 'count')).reset_index()
+        stats_ho['Label'] = stats_ho['Val'].apply(lambda x: f"{x:.1f}h") + " | " + stats_ho['Count'].astype(str)
+        c1, c2 = st.columns([3, 1])
+        with c1: st.altair_chart(plot_bar_chart(stats_ho, 'Val', group_col, '平均耗时(h)', 24, 'Label', True), use_container_width=True)
+        with c2:
+            tgt = st.selectbox(f"趋势-{group_col}", stats_ho.sort_values('Val', ascending=False)[group_col], key='s3')
+            if tgt:
+                d, f = get_trend_data(valid_ho[valid_ho[group_col]==tgt], 'Time_Shipped', 'Hours_Handover', granularity, 'mean')
+                st.altair_chart(plot_trend_interactive(d, f, '平均耗时(h)', False, 24), use_container_width=True)
+    st.divider()
+
+    # === 模块四：妥投时效 (使用预计算字段) ===
+    st.subheader("📦 4. 尾程妥投时效 (Days Transit)")
+    # 直接使用 Days_Transit (已在清洗阶段计算：妥投-发货)
+    if 'Days_Transit' in df_show.columns:
+        valid_otd = df_show[df_show['Days_Transit'].notnull()].copy()
+        # 剔除异常值 (比如 > 30天)
+        valid_otd = valid_otd[(valid_otd['Days_Transit'] >= 0) & (valid_otd['Days_Transit'] <= 30)]
+
+        if valid_otd.empty:
+            st.warning("无有效妥投数据 (请检查源数据是否有签收时间)")
+        else:
+            # 判断是否只选了 US
+            u_ctry = valid_otd['Country'].dropna().unique()
+            is_us_mode = (len(sel_ctry)==1 and 'US' in sel_ctry) or (len(u_ctry)==1 and u_ctry[0]=='US')
+
+            if not is_us_mode: # 全球模式
+                st.markdown("##### 🌍 全球/区域概览")
+                c1, c2 = st.columns(2)
+                with c1:
+                    s_wh = valid_otd.groupby('Warehouse').agg(Val=('Days_Transit', 'mean'), Count=('Order_ID', 'count')).reset_index()
+                    s_wh = s_wh[s_wh['Count']>5].sort_values('Val').head(15)
+                    s_wh['Label'] = s_wh['Val'].apply(lambda x: f"{x:.1f}d") + " | " + s_wh['Count'].astype(str)
+                    st.altair_chart(plot_bar_chart(s_wh, 'Val', 'Warehouse', '天数', 7, 'Label', True), use_container_width=True)
+                with c2:
+                    s_car = valid_otd.groupby('Carrier').agg(Val=('Days_Transit', 'mean'), Count=('Order_ID', 'count')).reset_index()
+                    s_car = s_car[s_car['Count']>5].sort_values('Val').head(15)
+                    s_car['Label'] = s_car['Val'].apply(lambda x: f"{x:.1f}d") + " | " + s_car['Count'].astype(str)
+                    st.altair_chart(plot_bar_chart(s_car, 'Val', 'Carrier', '天数', 7, 'Label', True), use_container_width=True)
+            else: # US 模式
+                st.markdown("##### 🇺🇸 美国 (US) 深度分析")
+                if 'Province_State' not in valid_otd.columns: st.error("缺州字段")
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    with c1: sel_wh = st.selectbox("📦 仓库", ['全部'] + sorted(valid_otd['Warehouse'].unique()), key='u1')
+                    with c2: sel_car = st.multiselect("🚛 物流商", sorted(valid_otd['Carrier'].unique()), key='u2')
+                    with c3: sel_st = st.multiselect("📍 目的州", sorted(valid_otd['Province_State'].dropna().unique()), key='u3')
+                    
+                    df_u = valid_otd.copy()
+                    if sel_wh != '全部': df_u = df_u[df_u['Warehouse'] == sel_wh]
+                    if sel_car: df_u = df_u[df_u['Carrier'].isin(sel_car)]
+                    if sel_st: df_u = df_u[df_u['Province_State'].isin(sel_st)]
+                    
+                    if not sel_st: # 热力图
+                        st.markdown("**🇺🇸 全美热力图 (Transit Time)**")
+                        s_map = df_u.groupby(['Carrier', 'Province_State']).agg(Val=('Days_Transit', 'mean'), C=('Order_ID', 'count')).reset_index()
+                        s_map = s_map[s_map['C'] >= 5]
+                        if not s_map.empty:
+                            base = alt.Chart(s_map).encode(x='Province_State:N', y='Carrier:N')
+                            heat = base.mark_rect().encode(color=alt.Color('Val:Q', scale=alt.Scale(scheme='yelloworangered')))
+                            txt = base.mark_text().encode(text=alt.Text('Val', format='.1f'), color=alt.value('black'))
+                            st.altair_chart((heat+txt).properties(height=350).interactive(), use_container_width=True)
+                    else: # 条形图
+                        st.markdown(f"**📍 {', '.join(sel_st)} 物流商对比**")
+                        s_cmp = df_u.groupby('Carrier').agg(Val=('Days_Transit', 'mean'), C=('Order_ID', 'count')).reset_index()
+                        s_cmp['Label'] = s_cmp['Val'].apply(lambda x: f"{x:.1f}d") + " | " + s_cmp['C'].astype(str)
+                        st.altair_chart(plot_bar_chart(s_cmp, 'Val', 'Carrier', '平均天数', 5, 'Label', True), use_container_width=True)
+    else:
+        st.info("缺 Days_Transit 字段，请重新运行清洗脚本")
+else:
+    # 状态提示：如果不是本地也不是上传，已经在上方显示了对应UI，所以这里不需要做什么
+    pass
