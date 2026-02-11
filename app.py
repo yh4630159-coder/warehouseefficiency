@@ -56,7 +56,7 @@ def get_trend_data(df, date_col, metric_col, granularity, mode='rate'):
     def fmt_val(val): return f"{val:.1%}" if mode == 'rate' else f"{val:.1f}h"
     
     if granularity == '周 (Week)':
-        res['Data_Label'] = "WEEK" + pd.Series(range(1, len(res)+1)).astype(str) + "\n" + res['Value'].apply(fmt_val)
+        res['Data_Label'] = "WEEK" + res['Date'].dt.isocalendar().week.astype(str).values + "\n" + res['Value'].apply(fmt_val)
         res['Trend'] = res['Value']
     elif granularity == '月 (Month)':
         res['Data_Label'] = res['Date'].dt.strftime('%Y-%m') + "\n" + res['Value'].apply(fmt_val)
@@ -189,12 +189,12 @@ if uploaded_file:
                     with c1:
                         s_wh = valid_otd.groupby('Warehouse').agg(Val=('Days_Transit', 'mean'), Count=('Order_ID', 'count')).reset_index()
                         s_wh = s_wh[s_wh['Count']>5].sort_values('Val').head(15)
-                        s_wh['Label'] = s_wh['Val'].apply(lambda x: f"{x:.1f}d")
+                        s_wh['Label'] = s_wh['Val'].apply(lambda x: f"{x:.1f}d") + " | " + s_wh['Count'].astype(str)
                         st.altair_chart(plot_bar_chart(s_wh, 'Val', 'Warehouse', '天数', 7, 'Label', True), use_container_width=True)
                     with c2:
                         s_car = valid_otd.groupby('Carrier').agg(Val=('Days_Transit', 'mean'), Count=('Order_ID', 'count')).reset_index()
                         s_car = s_car[s_car['Count']>5].sort_values('Val').head(15)
-                        s_car['Label'] = s_car['Val'].apply(lambda x: f"{x:.1f}d")
+                        s_car['Label'] = s_car['Val'].apply(lambda x: f"{x:.1f}d") + " | " + s_car['Count'].astype(str)
                         st.altair_chart(plot_bar_chart(s_car, 'Val', 'Carrier', '天数', 7, 'Label', True), use_container_width=True)
                 else: # US 模式
                     st.markdown("##### 🇺🇸 美国 (US) 深度分析")
@@ -222,7 +222,7 @@ if uploaded_file:
                         else: # 条形图
                             st.markdown(f"**📍 {', '.join(sel_st)} 物流商对比**")
                             s_cmp = df_u.groupby('Carrier').agg(Val=('Days_Transit', 'mean'), C=('Order_ID', 'count')).reset_index()
-                            s_cmp['Label'] = s_cmp['Val'].apply(lambda x: f"{x:.1f}d")
+                            s_cmp['Label'] = s_cmp['Val'].apply(lambda x: f"{x:.1f}d") + " | " + s_cmp['C'].astype(str)
                             st.altair_chart(plot_bar_chart(s_cmp, 'Val', 'Carrier', '平均天数', 5, 'Label', True), use_container_width=True)
         else:
             st.info("缺 Days_Transit 字段，请重新运行清洗脚本")
